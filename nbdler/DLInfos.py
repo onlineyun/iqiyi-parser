@@ -6,14 +6,16 @@ from .packer import Packer
 import threading
 import socket
 import sys
-
+from .DLError import DLUrlError
 import traceback
+from . import DLCommon as cv
 
 if sys.version_info >= (3, 0):
+    from http.client import HTTPResponse
     from http.cookiejar import CookieJar
     from urllib.parse import splittype, splithost, splittype, splitport
     from urllib.request import build_opener, Request, HTTPCookieProcessor
-    from urllib.error import URLError
+    from urllib.error import URLError, HTTPError
     from ssl import SSLError
 
 elif sys.version_info <= (2, 7):
@@ -24,7 +26,7 @@ elif sys.version_info <= (2, 7):
 
 
 
-def _content_type(type):
+def content_type(type):
     dict = {
         'application/octet-stream': '',
         'image/tiff': '.tif',
@@ -51,8 +53,9 @@ def _content_type(type):
     return dict[type] if type in dict.keys() else ''
 
 
-DEFAULT_MAX_THREAD = 5
-DEFAULT_MAX_CONNECTIONS = 16
+# DEFAULT_MAX_THREAD = 5
+# DEFAULT_MAX_CONNECTIONS = 16
+ERR_4XX_RETRY = 3
 
 HEADERS_CHROME = Headers([
     ('User-Agent', 'Mozilla/5.0 (Windows NT 6.1; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/66.0.3359.117 Safari/537.36'),
@@ -62,58 +65,95 @@ HEADERS_CHROME = Headers([
 ])
 
 class UrlPool(Packer, object):
-    def __init__(self, parent, max_retry=-1, max_conn=DEFAULT_MAX_CONNECTIONS, max_speed=-1):
+    def __init__(self, parent, max_retry=-1, max_conn=1, max_speed=-1):
         self.parent = parent
-        self.list = []
-        self.dict = {}
+        # self.list = []
+        self._url_box = {}
 
-        self.id_map = []
+        self._mapid = []
 
         self.max_conn = max_conn
         self.max_speed = max_speed
 
         self.max_retry = max_retry
 
-    def reloadBadUrl(self):
-        for i in self.list:
-            if not i.target.headers:
-                i.activate()
+
+
+    def reloadAll(self):
+        if not self._url_box:
+            return False
+        for i in self._url_box.values():
+            if self.load_url(i):
+                self._mapid[self.getUrlId(i)] = True
+                self.parent.file.updateFromUrl(urlobj)
+                break
+        else:
+            return False
+        return True
+
 
     def addNode(self, id=-1, url='', cookie='', headers=HEADERS_CHROME,
             host=None, port=None, path=None, protocol=None,
             proxy=None, max_thread=-1, range_format='Range: bytes=%d-%d'):
 
         if id == -1 or id is None:
-            id = self.newID()
+            id = self.newId()
 
         urlobj = Url(id, url, cookie, headers, host, port, path, protocol, proxy, max_thread, range_format)
-        if urlobj in self.dict.values():
+        if urlobj in self._url_box.values():
             return
-        self.list.append(urlobj)
-        self.dict[id] = urlobj
 
+        self._url_box[id] = urlobj
+        try:
+            if self.load_url(urlobj):
+                self._mapid[id] = True
+                self.parent.file.updateFromUrl(urlobj)
+        except DLUrlError as e:
+            if not self.reloadAll():
+                raise
+
+
+    def load_url(self, urlobj):
         retry_counter = self.max_retry
+        counter_4xx = 0
         while True:
             if self.max_retry == -1 or retry_counter > 0:
-                try:
-                    urlobj.activate()
-                except Exception as e:
-                    # traceback.print_exc()
-                    if self.parent.shutdown_flag:
-                        break
-                    if retry_counter != -1:
-                        retry_counter -= 1
-                        continue
-                    if self.parent.file.size != -1:
-                        break
-                    if not self.parent.file.name:
-                        self.parent.file.name = self.getFileName()
-                else:
-                    self.id_map[id] = True
-                    self.parent.file.updateFromUrl(urlobj)
+
+                res = urlobj.activate()
+                if isinstance(res, HTTPResponse):
                     break
+                if isinstance(res, HTTPError):
+                    if res.code >= 400 and res.code < 500:
+                        counter_4xx += 1
+                        if counter_4xx > ERR_4XX_RETRY or counter_4xx >= self.max_retry:
+                            if self.parent.file.size == -1 and len(self.parent.threads.getAll(cv.ADDNODE)) <= 1:
+                                _except = DLUrlError(self.parent, res)
+                                self.parent.globalprog.raiseUrlError(_except)
+                            return False
+
+                if self.parent.status.pausing():
+                    break
+                if retry_counter != -1:
+                    retry_counter -= 1
+                    continue
+                time.sleep(0.1)
+
             else:
-                raise Exception('MaxRetryExceed', 'UrlNotRespond')
+                _except = DLUrlError(self.parent, Exception('MaxRetryExceed', 'UrlNotRespond'))
+                self.parent.globalprog.raiseUrlError(_except)
+                return False
+        return True
+
+    def getAllId(self):
+        return self._mapid
+
+
+    def getUrlId(self, Url):
+        for i, j in self._url_box.items():
+            if j == Url:
+                return i
+
+        return None
 
 
     def getNextId(self, cur_id):
@@ -122,62 +162,62 @@ class UrlPool(Packer, object):
         while True:
             if next_id == cur_id:
                 raise Exception('NoUrlToSwitch', 'NoValidUrl')
-            if next_id >= len(self.id_map):
+            if next_id >= len(self._mapid):
                 next_id = 0
-            if self.id_map[next_id]:
+            if self._mapid[next_id]:
                 break
             else:
                 next_id += 1
         return next_id
 
     def getAllUrl(self):
-        return self.dict
+        return self._url_box
 
     def getUrl(self, Urlid):
-        return self.dict[Urlid]
+        return self._url_box[Urlid]
 
     def hasUrl(self, Url):
-        return Url in self.dict.keys()
+        return Url in self._url_box.keys()
 
-    def newID(self):
-        for i, j in enumerate(self.id_map):
+    def newId(self):
+        for i, j in enumerate(self._mapid):
             if not j:
                 return i
         else:
-            self.id_map.append(False)
-            return len(self.id_map) - 1
+            self._mapid.append(False)
+            return len(self._mapid) - 1
 
     def delete(self, id):
-        for i, j in enumerate(self.list):
-            if j.id == id:
-                del self.list[i]
-                break
+        # for i, j in enumerate(self.list):
+        #     if j.id == id:
+        #         del self.list[i]
+        #         break
 
-        del self.dict[id]
-        self.id_map[id] = False
+        del self._url_box[id]
+        self._mapid[id] = False
 
-    def getContentSize(self, index=0):
-        if not self.list:
-            return -1
+    # def getContentSize(self, index=0):
+    #     if not self.list:
+    #         return -1
+    #
+    #     return int(self.list[index].getContentSize())
 
-        return int(self.list[index].getContentSize())
-
-    def getFileName(self, index=0):
-        if not self.list:
-            return None
-        return self.list[index].getFileName()
+    # def getFileName(self, index=0):
+    #     if not self.list:
+    #         return None
+    #     return self.list[index].getFileName()
 
 
     def __packet_params__(self):
-        return ['list', 'dict', 'id_map', 'max_conn', 'max_speed']
+        return ['dict', 'id_map', 'max_conn', 'max_speed']
 
     def unpack(self, packet):
         Packer.unpack(self, packet)
 
-        for i, j in self.dict.items():
+        for i, j in self._url_box.items():
             url = Url(-1, '')
             url.unpack(j)
-            self.dict[i] = url
+            self._url_box[i] = url
         # for i, j in enumerate(self.list[:]):
         #     self.list[i] = j
 
@@ -187,6 +227,9 @@ class Target(object):
         self.url = None
         self.protocol = self.host = self.port = self.path = None
         self.headers = None
+
+        self.conn = None
+        self.resp = None
 
         self.code = None
 
@@ -217,11 +260,11 @@ class Target(object):
         if code:
             self.code = code
 
+
 class Url(Packer, object):
     def __init__(self, id, url, cookie='', headers=HEADERS_CHROME,
                  host=None, port=None, path=None, protocol=None,
                  proxy=None, max_thread=-1, range_format='Range: bytes=%d-%d'):
-
 
         self.id = id
 
@@ -284,7 +327,7 @@ class Url(Packer, object):
         if filename != '':
             if '.' not in filename or filename.split('.')[-1] == '':
 
-                extension = _content_type(self.target.headers.get('Content-Type'))
+                extension = content_type(self.target.headers.get('Content-Type'))
                 filename = filename + extension
 
         else:
@@ -314,6 +357,11 @@ class Url(Packer, object):
     def activate(self):
         res, cookie_dict = self.__request__()
         # if res.getcode() == 200 or res.getcode() == 206:
+        if not res:
+            return None
+        if not isinstance(res, HTTPResponse):
+            return res
+
         headers_items = ()
         if sys.version_info < (3, 0):
             headers_items = res.info().items()
@@ -321,6 +369,7 @@ class Url(Packer, object):
         if sys.version_info >= (3, 0):
             headers_items = res.getheaders()
         self.target.update(res.geturl(), headers_items, res.getcode())
+        return res
         # else:
         #     raise Exception('UrlNoRespond or UrlError')
 
@@ -333,17 +382,21 @@ class Url(Packer, object):
         if self.cookie:
             _header.update({'Cookie': self.cookie})
         req = Request(self.url, headers=_header, origin_req_host=self.host)
-        error_counter = 0
-        while error_counter < 3:
-            try:
-                res = opener.open(req)
-                break
-            except Exception as e:
-                # traceback.print_exc()
-                error_counter += 1
-            time.sleep(0.5)
-        else:
-            raise Exception('UrlNotRespond')
+
+        res = None
+
+        try:
+            res = opener.open(req)
+            # break
+        except HTTPError as e:
+            # if e.code >= 400 and e.code < 500:
+            return e, None
+
+        except (socket.timeout, URLError) as e:
+            return e, None
+        except Exception as e:
+            traceback.print_exc()
+            return e, None
 
         return res, Cookiejar._cookies
 
@@ -381,23 +434,22 @@ class File(Packer, object):
             self.extension = self.name[self.name.rindex('.'):] if '.' in self.name else ''
 
     def makeFile(self, withdir=True):
-        thrs = self.parent.thrpool.getThreadsFromName('Nbdler-AddNode')
-        if len(thrs) == 1 and self.size == -1:
-            thrs[0].join()
-            if self.parent.shutdown_flag:
-                return False
-        else:
-            while len(self.parent.thrpool.getThreadsFromName('Nbdler-AddNode')):
-                if self.size != -1:
-                    break
-                time.sleep(0.01)
-            else:
-                if self.size == -1:
-                    return False
-
-        if self.size == -1:
-            return False
-            # raise Exception('UrlTimeout.')
+        # thrs = self.parent.thrpool.getThreads('Nbdler-AddNode')
+        # if len(thrs) == 1 and self.size == -1:
+        #     thrs[0].join()
+        #     if self.parent.is_shutdown():
+        #         return False
+        #
+        # else:
+        #     while len(self.parent.thrpool.getThreads('Nbdler-AddNode')):
+        #         if self.size != -1:
+        #             break
+        #         if self.parent.is_shutdown():
+        #             return False
+        #         time.sleep(0.01)
+        #
+        # if self.size == -1:
+        #     return False
 
         if withdir:
             try:
@@ -412,9 +464,10 @@ class File(Packer, object):
         with open(os.path.join(self.path, self.name), 'wb') as f:
             if self.size == 0:
                 f.write(b'\x00')
-                return
-            f.seek(self.size - 1)
-            f.write(b'\x00')
+                # return
+            else:
+                f.seek(self.size - 1)
+                f.write(b'\x00')
         return True
 
     def checkName(self):

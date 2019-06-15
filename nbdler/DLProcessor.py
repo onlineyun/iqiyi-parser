@@ -1,11 +1,16 @@
 
-
+# from urllib import request
 import socket, ssl
 import threading
 import time
 from .DLInfos import Target
-import logging
+# import logging
 import traceback
+from .DLError import HTTPErrorCounter, DLUrlError
+# import gc
+# import io
+from . import DLCommon as cv
+import http.client
 
 import sys
 
@@ -14,9 +19,6 @@ if sys.version_info <= (2, 7):
 
 elif sys.version_info >= (3, 0):
     from urllib.parse import splitvalue, splitquery, urlencode
-
-
-logger = logging.getLogger('nbdler')
 
 
 TMP_BUFFER_SIZE = 1024 * 1024 * 1
@@ -38,46 +40,6 @@ class OpaReq:
         self.wait = 0
 
 
-class ErrorCounter(object):
-
-    _404__THRESHOLD = 5
-    _302__THRESHOLD = 20
-
-    RECV_TIMEOUT_THRESHOLD = 10
-    SOCKET_ERROR_THRESHOLD = 10
-
-    def __init__(self):
-        self._404_ = 0
-        self._302_ = 0
-
-        self.recv_error = 0
-        self.socket_error = 0
-
-        self.error_occur = False
-
-    def __setattr__(self, key, value):
-        object.__setattr__(self, key, value)
-        if key != 'error_occur':
-            for i, j in self.check().items():
-                if getattr(self, i, 0) > getattr(ErrorCounter, j, 0):
-                    self.error_occur = True
-                    break
-            else:
-                self.error_occur = False
-
-    def isError(self):
-        return self.error_occur
-
-    def clear(self):
-        self._404_ = self._302_ = self.recv_error = self.socket_error = 0
-
-    def check(self):
-        return {
-            '_404_': '_404__THRESHOLD',
-            '_302_': '_302__THRESHOLD',
-            'recv_error': 'RECV_TIMEOUT_THRESHOLD',
-            'socket_error': 'SOCKET_ERROR_THRESHOLD',
-        }
 
 
 class Processor(object):
@@ -93,16 +55,24 @@ class Processor(object):
 
         self.target = Target()
 
+        self.connection = None
+        self.respond = None
+
         self.__thread__ = None
 
         self.__opa_lock__ = threading.Lock()
         self.__run_lock__ = threading.Lock()
         self.__buff_lock__ = threading.Lock()
 
-        self.error_counter = ErrorCounter()
+        self.err = HTTPErrorCounter()
 
-    def _Thread(self, *args, **kwargs):
-        return self.getHandler().thrpool.Thread(*args, **kwargs)
+        self.critical = False
+
+        # self.shutdwon_flag = False
+        # self.err_counter =
+
+    def Thread(self, *args, **kwargs):
+        return self.getHandler().threads.Thread(*args, **kwargs)
 
     def loadUrl(self, Urlid):
 
@@ -117,22 +87,17 @@ class Processor(object):
         self.urlid = Urlid
 
     def isReady(self):
-        return self.progress.isReady()
+        return not self.progress.status.isGoEnd() and not self.progress.status.pausing() and \
+               not self.progress.status.isPaused() and not self.critical
+
 
     def isRunning(self):
-        return self.__thread__ and self.__thread__._started.is_set() and self.__thread__.isAlive()
+        return self.__thread__ and self.__thread__.isRunning()
 
-    def isPause(self):
-        return self.progress.isPause()
-
-    def isEnd(self):
-        return self.progress.isEnd()
-
-    def isGoEnd(self):
-        return self.progress.isGoEnd()
 
     def getHandler(self):
         return self.progress.globalprog.handler
+
 
     def selfCheck(self):
 
@@ -148,9 +113,6 @@ class Processor(object):
 
         if self.isReady():
             if not self.isRunning():
-                if self.error_counter.isError():
-                    self.getSwitch()
-
                 if self.opareq.cut:
                     self.getCut()
 
@@ -167,7 +129,8 @@ class Processor(object):
     def run(self):
         with self.__run_lock__:
             if self.selfCheck():
-                thr = self._Thread(target=self.__getdata__, name='Nbdler-Processor')
+
+                thr = self.Thread(target=self.__getdata__, name=cv.PROCESSOR)
                 self.__thread__ = thr
                 thr.start()
 
@@ -179,131 +142,134 @@ class Processor(object):
             self.getPause()
             return
 
-        sock, buff = self.makeSocket()
+        conn, res = self.makeConnection()
 
-        if not sock:
+        self.connection = conn
+        self.respond = res
 
-            self.error_counter.socket_error += 1
-            time.sleep(0.5)
-            self.run()
-            return
-        else:
+        if res:
+            if res.status == 206 or res.status == 200:
+                self.target.update(headers=res.headers._headers, code=res.status)
+                self.err.clear()
+                self.__recv_loop__(conn, res)
+            elif res.status >= 400 and res.status < 500:
+                print(res.status)
+                self._4xx(res)
+            elif res.status == 302:
+                self.target.update(url=res.headers.get('location'))
+            else:
+                print(res.status)
+            res.close()
 
-            status, _headers = parse_headers(buff[:(buff.index(b'\r\n\r\n'))])
-            self.target.update(headers=_headers, code=status)
-
-            if status == 200:
-                self.__200__(sock, buff)
-            elif status == 206:
-                self.__206__(sock, buff)
-            elif status == 302:
-                self.__302__(sock)
-            elif status == 405:
-                self.__405__(sock)
-            elif status == 404:
-                self.__404__(sock)
-            # elif status == 416:
-            #     self.__416__(sock)
-            elif status != 206 and status != 200:
-                self.__404__(sock)
-
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-                sock.close()
-            except socket.error:
-                pass
+        conn.close()
 
 
-    def makeSocket(self):
-        sock = None
-        buff = b''
+
+    def makeConnection(self):
+        conn = None
+        res = None
 
         try:
-            ip = socket.gethostbyname(self.target.host)
 
             if self.target.protocol == 'https':
-                sock = ssl.wrap_socket(socket.socket())
-
-                # ssl.SSLError: [SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake failure
-                sock.server_hostname = self.target.host
+                conn = http.client.HTTPSConnection(host=self.target.host, port=self.target.port)
             elif self.target.protocol == 'http':
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                conn = http.client.HTTPConnection(host=self.target.host, port=self.target.port)
 
-            assert sock is not None
-            if not sock:
-                self.error_counter.socket_error += 1
-                return None, b''
+            req_path, req_headers = self.makeReqHeaders()
 
-            sock.connect((ip, self.target.port))
-
-            packet = self.makeSocketPacket()
-
-            sock.send(packet)
-            buff = sock.recv(1024)
+            conn.request('GET', req_path, '', req_headers)
+            res = conn.getresponse()
+        except socket.timeout as e:
+            self._timeout(e)
         except Exception as e:
-            # print(e.args)
-            # traceback.print_exc()
-            self.error_counter.socket_error += 1
-            sock = None
+            traceback.print_exc()
+            self._unknown(e)
+
+        return conn, res
+
+
+    def makeReqHeaders(self):
+
+        range_format = self.url.range_format
+        Range = (self.progress.begin + self.progress.go_inc, self.progress.end)
+
+        req_path = self.target.path
+
+        req_headers = dict(self.url.headers.items())
+
+        if range_format[0] == '&':
+            path, query = splitquery(self.target.path)
+            query_dict = extract_query(query)
+            range_format = range_format % Range
+            for i in range_format[1:].split('&'):
+                param_key, param_value = splitvalue(i)
+                query_dict[param_key] = param_value
+
+            new_query = urlencode(query_dict)
+            req_path = '%s?%s' % (path, new_query)
+
         else:
-            if not buff:
-                sock.shutdown(socket.SHUT_RDWR)
-                sock.close()
-                sock = None
+
+            range_field = range_format % Range
+            key_value = [i.strip() for i in range_field.split(':')]
+
+            key = key_value[0]
+            value = key_value[1]
+
+            add_headers = {
+                key: value,
+                'Accept-Ranges': 'bytes'
+            }
+
+            req_headers.update(add_headers)
+
+        return req_path, req_headers
+
+
+
+    def _unknown(self, res):
+        handler = self.getHandler()
+        try:
+            self.err.http_unknown(handler, res)
+        except DLUrlError as e:
+            if self.err.getCounter('unknown') >= len(handler.url.getAllUrl()) * HTTPErrorCounter.ERR_UNKNOWN_THRESHOLD:
+                self.getCritical(e)
             else:
-                while b'\r\n\r\n' not in buff:
-                    buff += sock.recv(512)
-                    if b'HTTP' not in buff:
-                        sock.shutdown(socket.SHUT_RDWR)
-                        sock.close()
-                        sock = None
-                        break
+                self.getSwitch()
 
-        return sock, buff
+    def _4xx(self, res):
+        handler = self.getHandler()
+        try:
+            self.err.http_4xx(handler, res)
+        except DLUrlError as e:
+            if self.err.getCounter(res.status) >= len(handler.url.getAllUrl()) * HTTPErrorCounter.ERR_4XX_THRESHOLD:
+                self.getCritical(e)
+            else:
+                self.getSwitch()
 
-    def __302__(self, sock):
-        if self.target.headers.get('location', None):
-            self.target.load(self.target.headers.get('location'))
+    def _timeout(self, res):
+        handler = self.getHandler()
+        try:
+            self.err.http_timeout(handler, res)
+        except DLUrlError as e:
+            if self.err.getCounter('timeout') >= len(handler.url.getAllUrl())*HTTPErrorCounter.ERR_TIMEOUT_THRESHOLD:
+                self.getCritical(e)
 
-        self.run()
+            else:
+                self.getSwitch()
 
-    def __206__(self, sock, buff):
-        self.__200__(sock, buff)
-
-    def __200__(self, sock, buff):
-        self.error_counter.clear()
-
-        buff = buff[(buff.index(b'\r\n\r\n') + 4):]
-
-        self.progress.go(len(buff))
-        self.__recv_loop__(sock, buff)
-
-    def __405__(self, sock):
-        self.getSwitch()
-        time.sleep(0.1)
-        self.run()
-
-    def __404__(self, sock):
-        self.error_counter._404_ += 1
-        if self.error_counter._404_ > 3:
-            self.url.reload()
-
-        time.sleep(0.3)
-        self.run()
-
-    def __other__(self, sock):
-        pass
+    def isCritical(self):
+        return self.critical
 
 
-    def __416__(self, sock):
-        self.error_counter._404_ += 1
-        self.progress.go_in = 0
-        self.progress.done_inc = 0
-        time.sleep(0.1)
-        self.run()
+    def getCritical(self, err):
+        self.critical = True
+        self.shutdown()
+        self.progress.globalprog.raiseUrlError(err)
 
-
-    def __recv_loop__(self, sock, buff):
+    def __recv_loop__(self, conn, res):
+        buff = b''
         while True:
             if self.opareq.cut:
                 self.getCut()
@@ -322,27 +288,25 @@ class Processor(object):
                 if rest == 0:
                     if len(buff) != 0:
                         self.buffer(buff)
-                        buff = []
+                        buff = ''
                         self.close()
                     break
                 elif rest < 4096:
-                    buff += sock.recv(rest)
+                    buff += res.read(rest)
                 else:
-                    buff += sock.recv(4096)
+                    buff += res.read(4096)
             except:
 
-                self.error_counter.recv_error += 1
                 self.buffer(buff[:last_len])
                 return
 
             if len(buff) == last_len:
-                self.error_counter.recv_error += 1
                 if len(buff) != 0:
                     self.buffer(buff)
                 return
 
             if len(buff) - last_len > rest:
-                self.error_counter.recv_error += 1
+                self.buffer(buff[:self.progress.length - self.progress.done_inc - self.buff_inc])
                 return
 
             self.progress.go(len(buff) - last_len)
@@ -356,69 +320,20 @@ class Processor(object):
                 buff = b''
 
 
-
     def close(self):
-        self.progress.globalprog.checkAllGoEnd()
+        self.progress.globalprog.ckeckAllGoEnd()
         self.opareq.clear()
 
 
     def pause(self):
         self.opareq.pause = True
+        self.progress.status.startPause()
+
+    shutdown = pause
 
     def getPause(self):
-        self.progress.status.pause()
         self.opareq.pause = False
-
-    def makeSocketPacket(self):
-
-        range_format = self.url.range_format
-        Range = (self.progress.begin + self.progress.go_inc, self.progress.end)
-
-        add_headers = {
-            'Host': self.target.host,
-            'Connection': 'keep-alive',
-        }
-
-        if range_format[0] == '&':
-            path, query = splitquery(self.target.path)
-            query_dict = extract_query(query)
-            range_format = range_format % Range
-            for i in range_format[1:].split('&'):
-                param_key, param_value = splitvalue(i)
-                query_dict[param_key] = param_value
-
-            new_query = urlencode(query_dict)
-            http_head_top = 'GET %s HTTP/1.1\r\n' % ('%s?%s' % (path, new_query))
-
-            packet = http_head_top + '%s\r\n\r\n'
-            add_headers = {
-                'Host': self.target.host,
-                'Connection': 'keep-alive'
-            }
-
-        else:
-            http_head_top = 'GET %s HTTP/1.1\r\n' % self.target.path
-
-            packet = http_head_top + '%s\r\n\r\n'
-            range_field = range_format % Range
-            key_value = [i.strip() for i in range_field.split(':')]
-
-            key = key_value[0]
-            value = key_value[1]
-
-            add_headers[key] = value
-            add_headers['Accept-Ranges'] = 'bytes'
-
-        request_headers = dict(self.url.headers.items())
-        request_headers.update(add_headers)
-        request_headers_str = []
-        for i in request_headers.items():
-            request_headers_str.append(': '.join(i))
-
-        packet = packet % '\r\n'.join(request_headers_str)
-
-        return str.encode(str(packet))
-
+        self.progress.status.endPause()
 
     def getWait(self):
         time.sleep(self.opareq.wait)
@@ -428,14 +343,13 @@ class Processor(object):
         next_urlid = self.getHandler().url.getNextId(self.urlid)
         self.loadUrl(next_urlid)
 
-        self.error_counter.clear()
 
     def buffer(self, buff):
         with self.__buff_lock__:
             self.buff.append(buff)
             self.buff_inc += len(buff)
 
-            self.progress.globalprog.checkBuffer(len(buff))
+        self.progress.globalprog.checkBuffer(len(buff))
 
     def clearBuffer(self):
         self.buff = []
@@ -444,14 +358,11 @@ class Processor(object):
     def releaseBuffer(self, f):
         with self.__buff_lock__:
             f.seek(self.progress.begin + self.progress.done_inc)
-            total_buff = 0
-            for block in self.buff:
-                f.write(block)
-                total_buff += len(block)
-            self.progress.done(total_buff)
+            buff = b''.join(self.buff)
+            f.write(buff)
+            self.progress.done(len(buff))
 
             self.clearBuffer()
-
 
     def cutRequest(self, Range):
 
@@ -460,12 +371,10 @@ class Processor(object):
         self.opareq.cut = [Range[0], Range[1]]
 
         while True:
-            if self.isEnd() or ((self.isReady() and not self.isRunning() and
-                    not self.getHandler().thrpool.getThreadsFromName('Nbdler-SelfCheck')) or \
-                    not self.opareq.cut):
+            if not self.opareq.cut or (self.isReady() and not self.isRunning() and not self.getHandler().threads.getAll(cv.INSPECTOR)):
                 break
 
-            time.sleep(0.1)
+            time.sleep(0.01)
 
         return [self.progress.end, last_range[1]] if last_range[1] != self.progress.end else []
 
@@ -482,32 +391,7 @@ class Processor(object):
         if retrange:
             self.progress.globalprog.cut(self.progress, retrange)
 
-
         self.opareq.cut = []
-
-
-    # def __str__(self):
-    #     return
-
-
-
-def parse_headers(http_msg):
-
-    http_msg = bytes.decode(http_msg)
-    status_bar = http_msg[:http_msg.index('\r\n') + 2]
-    status = int(status_bar.split(' ')[1])
-
-    header = http_msg[http_msg.index('\r\n') + 2:]
-
-    res_headers = []
-
-    for i in header.split('\r\n'):
-        if i:
-            name = i[:i.index(':')].lower().strip()
-            value = i[i.index(':') + 1:].lstrip()
-            res_headers.append((name, value))
-
-    return status, res_headers
 
 
 
